@@ -79,6 +79,12 @@ $ npm install jsdom
 
 ## Deploy
 
+If you've cloned the repository then remember to install the dependencies. This will take a while because the binary is large:
+
+```bash
+$ npm install
+```
+
 Before you deploy you can always test it locally. Make sure to be inside of the function app folder for instance `web-crawler-func-app` in this project:
 
 ```bash
