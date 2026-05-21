@@ -1,79 +1,93 @@
 const { app } = require('@azure/functions');
 const { JSDOM } = require('jsdom');
 
-const links = [
-    "https://en.wikipedia.org/wiki/Elasticsearch",
-    "https://en.wikipedia.org/wiki/Main_Page",
-    "https://en.wikipedia.org/wiki/Wikipedia",
-    "https://en.wikipedia.org/wiki/English_Wikipedia",
-    "https://en.wikipedia.org/wiki/Internet_encyclopedia",
-    "https://en.wikipedia.org/wiki/Online_encyclopedia",
-    "https://en.wikipedia.org/wiki/Encyclopedia",
-    "https://en.wikipedia.org/wiki/Encyclopedia_(disambiguation)",
-    "https://en.wikipedia.org/wiki/Encyclopedia_(album)",
-    "https://en.wikipedia.org/wiki/Album"
-];
+// Looks up the top Wikipedia article for a query using the OpenSearch API.
+// Returns { title, url } or null if nothing is found.
+async function findWikipediaArticle(query, language) {
+    const lang = language === 'da' ? 'da' : 'en';
+    const apiUrl = `https://${lang}.wikipedia.org/w/api.php?action=opensearch&search=${encodeURIComponent(query)}&limit=1&format=json`;
 
-async function crawlPage(pageUrl, visitedUrls) {
-    const cleanUrl = new URL(pageUrl);
-    cleanUrl.hash = '';
+    const response = await fetch(apiUrl);
+    if (!response.ok) return null;
 
-    if (visitedUrls.has(cleanUrl.href)) {
-        return;
-    }
+    const [, titles, , urls] = await response.json();
+    if (!urls || urls.length === 0) return null;
 
-    visitedUrls.add(cleanUrl.href);
+    return { title: titles[0], url: urls[0] };
+}
 
-    try {
-        const response = await fetch(cleanUrl.href);
-        if (!response.ok) {
-            console.error(`Failed to fetch ${cleanUrl.href}: ${response.statusText}`);
+// Fetches a Wikipedia page and extracts readable text content using JSDOM.
+async function scrapeWikipediaPage(pageUrl) {
+    const response = await fetch(pageUrl);
+    if (!response.ok) return null;
+
+    const html = await response.text();
+    const { window } = new JSDOM(html);
+    const document = window.document;
+
+    const content = Array.from(
+        document.querySelectorAll('.mw-parser-output p, .mw-parser-output h1, .mw-parser-output h2, .mw-parser-output h3')
+    )
+        .map(el => el.textContent.trim())
+        .filter(text => text.length > 0)
+        .join(' ')
+        .replace(/[\t\n\r]+/g, ' ')
+        .trim();
+
+    return content || null;
+}
+
+// Azure Storage Queue trigger — fires for every missed search enqueued by the Go server.
+// The Go server base64-encodes a JSON message: { "query": "...", "language": "en" }
+// The Azure Functions runtime automatically base64-decodes it and parses JSON.
+app.storageQueue('web-crawler-queue-trigger', {
+    queueName: process.env.QUEUE_NAME || 'missed-searches',
+    connection: 'AzureWebJobsStorage',
+    handler: async (queueItem, context) => {
+        // The runtime delivers the decoded message; handle both object and string forms.
+        const message = typeof queueItem === 'string' ? JSON.parse(queueItem) : queueItem;
+        const { query, language } = message;
+
+        context.log(`Processing missed search: "${query}" (language: ${language})`);
+
+        const article = await findWikipediaArticle(query, language);
+        if (!article) {
+            context.log(`No Wikipedia article found for: "${query}"`);
             return;
         }
 
-        const html = await response.text();
-        const { window } = new JSDOM(html);
-        const document = window.document;
-
-        const mainContent = Array.from(document.querySelectorAll('.mw-parser-output p, .mw-parser-output h1, .mw-parser-output h2, .mw-parser-output h3'))
-            .map(element => element.textContent.trim())
-            .join(' ')
-            .replace(/[\t\n\r]+/g, ' ')
-            .trim();
-
-        console.log('Indexing:', cleanUrl.href);
-        return { url: cleanUrl.href, content: mainContent };
-
-    } catch (error) {
-        console.error(`Error crawling ${cleanUrl.href}:`, error);
-    }
-}
-
-app.http('web-crawler-func-app', {
-    methods: ['GET', 'POST'],
-    authLevel: 'anonymous',
-    handler: async (request, context) => {
-
-        try {
-            const visitedUrls = new Set();
-            const crawledContent = await Promise.all(links.map(link => crawlPage(link, visitedUrls)));
-
-
-            for (let i = 0; i < crawledContent.length; i++) {
-                context.log(`URL: ${crawledContent[i].url}`);
-                context.log(`Content: ${crawledContent[i].content.substring(0, 100)}`);
-                context.log("==========================================================");
-            }
-
-            return {
-                status: 200,
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(crawledContent),
-            };
-        } catch (error) {
-            context.log.error('Crawl process failed:', error);
-            return { status: 500, body: 'An error occurred during the crawl.' };
+        const content = await scrapeWikipediaPage(article.url);
+        if (!content) {
+            context.log(`Could not extract content from: ${article.url}`);
+            return;
         }
-        
-    }
+
+        const serverUrl = process.env.WHOKNOWS_SERVER_URL;
+        const apiKey = process.env.WHOKNOWS_SCRAPER_API_KEY;
+
+        if (!serverUrl || !apiKey) {
+            context.log.error('WHOKNOWS_SERVER_URL or WHOKNOWS_SCRAPER_API_KEY is not set');
+            return;
+        }
+
+        const response = await fetch(`${serverUrl}/api/pages`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-Scraper-Key': apiKey,
+            },
+            body: JSON.stringify({
+                title: article.title,
+                url: article.url,
+                language: language || 'en',
+                content,
+            }),
+        });
+
+        if (response.ok) {
+            context.log(`Indexed: "${article.title}" (${article.url})`);
+        } else {
+            context.log.error(`Failed to index "${article.title}": HTTP ${response.status}`);
+        }
+    },
 });
