@@ -16,7 +16,10 @@ async function findWikipediaArticle(query, language) {
     return { title: titles[0], url: urls[0] };
 }
 
+const SKIP_SECTIONS = new Set(['references', 'external links', 'see also', 'notes', 'further reading', 'citations']);
+
 // Fetches a Wikipedia page and extracts readable text content using JSDOM.
+// Stops at reference/external-link sections and strips inline citation markers like [1].
 async function scrapeWikipediaPage(pageUrl) {
     const response = await fetch(pageUrl);
     if (!response.ok) return null;
@@ -25,15 +28,19 @@ async function scrapeWikipediaPage(pageUrl) {
     const { window } = new JSDOM(html);
     const document = window.document;
 
-    const content = Array.from(
-        document.querySelectorAll('.mw-parser-output p, .mw-parser-output h1, .mw-parser-output h2, .mw-parser-output h3')
-    )
-        .map(el => el.textContent.trim())
-        .filter(text => text.length > 0)
-        .join(' ')
-        .replace(/[\t\n\r]+/g, ' ')
-        .trim();
+    const elements = document.querySelectorAll('.mw-parser-output p, .mw-parser-output h1, .mw-parser-output h2, .mw-parser-output h3');
+    const parts = [];
 
+    for (const el of elements) {
+        if (el.tagName !== 'P') {
+            const heading = el.textContent.trim().toLowerCase().replace(/\[.*?\]/g, '').trim();
+            if (SKIP_SECTIONS.has(heading)) break;
+        }
+        const text = el.textContent.trim().replace(/\[.*?\]/g, '').trim();
+        if (text.length > 0) parts.push(text);
+    }
+
+    const content = parts.join(' ').replace(/[\t\n\r]+/g, ' ').trim();
     return content || null;
 }
 
